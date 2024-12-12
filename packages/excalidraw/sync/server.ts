@@ -2,8 +2,8 @@ import AsyncLock from "async-lock";
 import { Utils } from "./utils";
 
 import type {
-  ChangesRepository,
-  CLIENT_CHANGE,
+  IncrementsRepository,
+  CLIENT_INCREMENT,
   CLIENT_MESSAGE,
   PULL_PAYLOAD,
   PUSH_PAYLOAD,
@@ -20,7 +20,7 @@ export class ExcalidrawSyncServer {
   private readonly lock: AsyncLock = new AsyncLock();
   private readonly sessions: Set<WebSocket> = new Set();
 
-  constructor(private readonly changesRepository: ChangesRepository) {}
+  constructor(private readonly incrementsRepository: IncrementsRepository) {}
 
   public onConnect(client: WebSocket) {
     this.sessions.add(client);
@@ -59,7 +59,7 @@ export class ExcalidrawSyncServer {
     // CFDO: test for invalid payload
     const lastAcknowledgedClientVersion = payload.lastAcknowledgedVersion;
     const lastAcknowledgedServerVersion =
-      this.changesRepository.getLastVersion();
+      this.incrementsRepository.getLastVersion();
 
     const versionΔ =
       lastAcknowledgedServerVersion - lastAcknowledgedClientVersion;
@@ -79,28 +79,28 @@ export class ExcalidrawSyncServer {
 
     if (versionΔ > 0) {
       // CFDO: for versioning we need deletions, but not for the "snapshot" update
-      const changes = this.changesRepository.getSinceVersion(
+      const increments = this.incrementsRepository.getSinceVersion(
         lastAcknowledgedClientVersion,
       );
       this.send(client, {
         type: "acknowledged",
         payload: {
-          changes,
+          increments,
         },
       });
     }
   }
 
   private push(client: WebSocket, payload: PUSH_PAYLOAD) {
-    const { type, changes } = payload;
+    const { type, increments } = payload;
 
     switch (type) {
       case "ephemeral":
-        return this.relay(client, { changes });
+        return this.relay(client, { increments });
       case "durable":
         const [acknowledged, error] = Utils.try(() => {
-          // CFDO: try to apply the changes to the snapshot
-          return this.changesRepository.saveAll(changes);
+          // CFDO: try to apply the increments to the snapshot
+          return this.incrementsRepository.saveAll(increments);
         });
 
         if (error) {
@@ -108,7 +108,7 @@ export class ExcalidrawSyncServer {
             type: "rejected",
             payload: {
               message: error.message,
-              changes,
+              increments,
             },
           });
         }
@@ -116,7 +116,7 @@ export class ExcalidrawSyncServer {
         return this.broadcast({
           type: "acknowledged",
           payload: {
-            changes: acknowledged,
+            increments: acknowledged,
           },
         });
       default:
@@ -126,7 +126,7 @@ export class ExcalidrawSyncServer {
 
   private relay(
     client: WebSocket,
-    payload: { changes: Array<CLIENT_CHANGE> } | RELAY_PAYLOAD,
+    payload: { increments: Array<CLIENT_INCREMENT> } | RELAY_PAYLOAD,
   ) {
     return this.broadcast(
       {

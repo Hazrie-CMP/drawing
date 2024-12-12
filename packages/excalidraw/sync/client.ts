@@ -1,12 +1,86 @@
 /* eslint-disable no-console */
+import throttle from "lodash.throttle";
+import debounce from "lodash.debounce";
 import { Utils } from "./utils";
-import { ElementsChange } from "../change";
+import { StoreIncrement } from "../store";
 import type { ExcalidrawImperativeAPI } from "../types";
 import type { SceneElementsMap } from "../element/types";
-import type { CLIENT_CHANGE, PUSH_PAYLOAD, SERVER_CHANGE } from "./protocol";
-import throttle from "lodash.throttle";
+import type {
+  CLIENT_INCREMENT,
+  PUSH_PAYLOAD,
+  SERVER_INCREMENT,
+} from "./protocol";
 
-export class ExcalidrawSyncClient {
+interface IncrementsRepository {
+  loadIncrements(): Promise<{ increments: Array<StoreIncrement> } | null>;
+  saveIncrements(params: { increments: Array<StoreIncrement> }): Promise<void>;
+}
+
+interface MetadataRepository {
+  loadMetadata(): Promise<{ lastAcknowledgedVersion: number } | null>;
+  saveMetadata(metadata: { lastAcknowledgedVersion: number }): Promise<void>;
+}
+
+// CFDO: make sure the increments are always acknowledged (deleted from the repository)
+export class SyncQueue {
+  private readonly queue: Map<string, StoreIncrement>;
+  private readonly repository: IncrementsRepository;
+
+  private constructor(
+    queue: Map<string, StoreIncrement> = new Map(),
+    repository: IncrementsRepository,
+  ) {
+    this.queue = queue;
+    this.repository = repository;
+  }
+
+  public static async create(repository: IncrementsRepository) {
+    const data = await repository.loadIncrements();
+
+    return new SyncQueue(
+      new Map(data?.increments?.map((increment) => [increment.id, increment])),
+      repository,
+    );
+  }
+
+  public getAll() {
+    return Array.from(this.queue.values());
+  }
+
+  public has(id: StoreIncrement["id"]) {
+    return this.queue.has(id);
+  }
+
+  public add(...increments: StoreIncrement[]) {
+    for (const increment of increments) {
+      this.queue.set(increment.id, increment);
+    }
+
+    this.persist();
+  }
+
+  public remove(...ids: StoreIncrement["id"][]) {
+    for (const id of ids) {
+      this.queue.delete(id);
+    }
+
+    this.persist();
+  }
+
+  public persist = throttle(
+    async () => {
+      try {
+        await this.repository.saveIncrements({ increments: this.getAll() });
+      } catch (e) {
+        console.error("Failed to persist the sync queue:", e);
+      }
+    },
+    1000,
+    { leading: false, trailing: true },
+  );
+}
+
+export class SyncClient {
   private static readonly HOST_URL = import.meta.env.DEV
     ? "ws://localhost:8787"
     : "https://excalidraw-sync.marcel-529.workers.dev";
@@ -17,18 +91,28 @@ export class ExcalidrawSyncClient {
 
   private static readonly RECONNECT_INTERVAL = 10_000;
 
-  private lastAcknowledgedVersion = 0;
-
   private readonly api: ExcalidrawImperativeAPI;
-  private readonly roomId: string;
-  private readonly queuedChanges: Map<
-    string,
-    { queuedAt: number; change: CLIENT_CHANGE }
-  > = new Map();
-  public readonly acknowledgedChanges: Array<ElementsChange> = [];
+  private readonly queue: SyncQueue;
+  private readonly repository: MetadataRepository;
 
-  private get localChanges() {
-    return Array.from(this.queuedChanges.values()).map(({ change }) => change);
+  // CFDO: shouldn't be stateful, only request / response
+  private readonly acknowledgedIncrementsMap: Map<string, StoreIncrement> = new Map();
+
+  public get acknowledgedIncrements() {
+    return Array.from(this.acknowledgedIncrementsMap.values());
+  };
+
+  private readonly roomId: string;
+
+  private _lastAcknowledgedVersion = 0;
+
+  private get lastAcknowledgedVersion() {
+    return this._lastAcknowledgedVersion;
+  }
+
+  private set lastAcknowledgedVersion(version: number) {
+    this._lastAcknowledgedVersion = version;
+    this.repository.saveMetadata({ lastAcknowledgedVersion: version });
   }
 
   private server: WebSocket | null = null;
@@ -38,15 +122,33 @@ export class ExcalidrawSyncClient {
 
   private isConnecting: { done: (error?: Error) => void } | null = null;
 
-  constructor(
+  private constructor(
     api: ExcalidrawImperativeAPI,
-    roomId: string = ExcalidrawSyncClient.ROOM_ID,
+    repository: MetadataRepository,
+    queue: SyncQueue,
+    options: { roomId: string; lastAcknowledgedVersion: number },
   ) {
     this.api = api;
-    this.roomId = roomId;
+    this.repository = repository;
+    this.queue = queue;
+    this.roomId = options.roomId;
+    this.lastAcknowledgedVersion = options.lastAcknowledgedVersion;
+  }
 
-    // CFDO: persist in idb
-    this.lastAcknowledgedVersion = 0;
+  public static async create(
+    api: ExcalidrawImperativeAPI,
+    repository: IncrementsRepository & MetadataRepository,
+    roomId: string = SyncClient.ROOM_ID,
+  ) {
+    const [queue, metadata] = await Promise.all([
+      SyncQueue.create(repository),
+      repository.loadMetadata(),
+    ]);
+
+    return new SyncClient(api, repository, queue, {
+      roomId,
+      lastAcknowledgedVersion: metadata?.lastAcknowledgedVersion ?? 0,
+    });
   }
 
   // CFDO: throttle does not work that well here (after some period it tries to reconnect too often)
@@ -74,7 +176,7 @@ export class ExcalidrawSyncClient {
 
         return await new Promise<void>((resolve, reject) => {
           this.server = new WebSocket(
-            `${ExcalidrawSyncClient.HOST_URL}/connect?roomId=${this.roomId}`,
+            `${SyncClient.HOST_URL}/connect?roomId=${this.roomId}`,
           );
 
           // wait for 10 seconds before timing out
@@ -103,7 +205,7 @@ export class ExcalidrawSyncClient {
         this.disconnect(e as Error);
       }
     },
-    ExcalidrawSyncClient.RECONNECT_INTERVAL,
+    SyncClient.RECONNECT_INTERVAL,
     { leading: true },
   );
 
@@ -125,7 +227,7 @@ export class ExcalidrawSyncClient {
         this.reconnect();
       }
     },
-    ExcalidrawSyncClient.RECONNECT_INTERVAL,
+    SyncClient.RECONNECT_INTERVAL,
     { leading: true },
   );
 
@@ -145,8 +247,8 @@ export class ExcalidrawSyncClient {
     // resolve the current connection
     this.isConnecting.done();
 
-    // initiate pull
-    this.pull();
+    // CFDO: hack to pull everything for on init
+    this.pull.call({ lastAcknowledgedVersion: 0 });
   };
 
   private onClose = (event: CloseEvent) => {
@@ -196,26 +298,19 @@ export class ExcalidrawSyncClient {
 
   public push = (
     type: "durable" | "ephemeral" = "durable",
-    changes: Array<CLIENT_CHANGE> = [],
+    ...increments: Array<CLIENT_INCREMENT>
   ): void => {
-    const payload: PUSH_PAYLOAD = { type, changes: [] };
+    const payload: PUSH_PAYLOAD = { type, increments: [] };
 
     if (type === "durable") {
-      // CFDO: persist in idb (with insertion order)
-      for (const change of changes) {
-        this.queuedChanges.set(change.id, {
-          queuedAt: Date.now(),
-          change,
-        });
-      }
-
-      // batch all queued changes
-      payload.changes = this.localChanges;
+      this.queue.add(...increments);
+      // batch all (already) queued increments
+      payload.increments = this.queue.getAll();
     } else {
-      payload.changes = changes;
+      payload.increments = increments;
     }
 
-    if (payload.changes.length > 0) {
+    if (payload.increments.length > 0) {
       this.send({
         type: "push",
         payload,
@@ -230,60 +325,58 @@ export class ExcalidrawSyncClient {
     });
   }
 
-  // CFDO: refactor by applying all operations to store, not to the elements
-  private handleAcknowledged(payload: { changes: Array<SERVER_CHANGE> }) {
-    const { changes: remoteChanges } = payload;
+  private schedulePush = () =>
+    debounce(this.push, 1000, { leading: true, trailing: false });
 
+  private schedulePull = () =>
+    debounce(this.pull, 1000, { leading: true, trailing: false });
+
+  // CFDO: refactor by applying all operations to store, not to the elements
+  private handleAcknowledged(payload: { increments: Array<SERVER_INCREMENT> }) {
+    const { increments: remoteIncrements } = payload;
     const oldAcknowledgedVersion = this.lastAcknowledgedVersion;
+
     let elements = new Map(
+      // CFDO: retrieve the map already
       this.api.getSceneElementsIncludingDeleted().map((el) => [el.id, el]),
     ) as SceneElementsMap;
 
     try {
-      // apply remote changes
-      for (const remoteChange of remoteChanges) {
-        if (this.queuedChanges.has(remoteChange.id)) {
-          const { change, queuedAt } = this.queuedChanges.get(remoteChange.id)!;
-          this.acknowledgedChanges.push(change);
-          console.info(
-            `Acknowledged change "${remoteChange.id}" after ${
-              Date.now() - queuedAt
-            }ms`,
-          );
-          // local change acknowledge by the server, safe to remove
-          this.queuedChanges.delete(remoteChange.id);
-        } else {
-          // CFDO: we might not need to be that strict here
-          if (this.lastAcknowledgedVersion + 1 !== remoteChange.version) {
-            throw new Error(
-              `Received out of order change, expected "${
-                this.lastAcknowledgedVersion + 1
-              }", but received "${remoteChange.version}"`,
-            );
-          }
+      // apply remote increments
+      for (const { id, version, payload } of remoteIncrements) {
+        // CFDO: hack to load all increments
+        this.acknowledgedIncrementsMap.set(id, StoreIncrement.load(payload));
 
-          const change = ElementsChange.load(remoteChange.payload);
-          [elements] = change.applyTo(
+        if (this.queue.has(id)) {
+          // local increment acknowledged by the server, safe to remove
+          this.queue.remove(id);
+        } else {
+          const remoteIncrement = StoreIncrement.load(payload);
+          [elements] = remoteIncrement.elementsChange.applyTo(
             elements,
             this.api.store.snapshot.elements,
           );
-          this.acknowledgedChanges.push(change);
         }
 
-        this.lastAcknowledgedVersion = remoteChange.version;
+        // it's fine to apply increments our of order,
+        // as they are idempontent, so that we can re-apply them again,
+        // as long as we don't mark them as acknowledged
+        if (this.lastAcknowledgedVersion + 1 === version) {
+          this.lastAcknowledgedVersion = version;
+        } else {
+          // eslint-disable-next-line prettier/prettier
+         console.debug(
+            `Received out of order increment, expected "${
+              this._lastAcknowledgedVersion + 1
+            }", but received "${version}"`,
+          );
+        }
       }
 
-      console.debug(`${now()} remote changes`, remoteChanges);
-      console.debug(`${now()} local changes`, this.localChanges);
-      console.debug(
-        `${now()} acknowledged changes`,
-        this.acknowledgedChanges.slice(-remoteChanges.length),
-      );
-
-      // apply local changes
-      // CFDO: only necessary when remote changes modified same element properties!
-      for (const localChange of this.localChanges) {
-        [elements] = localChange.applyTo(
+      // apply local increments
+      for (const localIncrement of this.queue.getAll()) {
+        // CFDO: in theory only necessary when remote increments modified same element properties!
+        [elements] = localIncrement.elementsChange.applyTo(
           elements,
           this.api.store.snapshot.elements,
         );
@@ -294,38 +387,30 @@ export class ExcalidrawSyncClient {
         storeAction: "update",
       });
 
-      // push all queued changes
-      this.push();
+      this.schedulePush();
     } catch (e) {
-      console.error("Failed to apply acknowledged changes:", e);
-      // rollback the last acknowledged version
+      // rollback the last acknowledged version and schedule to pull again
+      console.error("Failed to apply acknowledged increments:", e);
       this.lastAcknowledgedVersion = oldAcknowledgedVersion;
-      // pull again to get the latest changes
-      this.pull();
+      this.schedulePull();
     }
   }
 
   private handleRejected(payload: { ids: Array<string>; message: string }) {
-    // handle rejected changes
+    // handle rejected increments
     console.error("Rejected message received:", payload);
   }
 
-  private handleRelayed(payload: { changes: Array<CLIENT_CHANGE> }) {
-    // apply relayed changes / buffer
+  private handleRelayed(payload: { increments: Array<CLIENT_INCREMENT> }) {
+    // apply relayed increments / buffer
     console.log("Relayed message received:", payload);
   }
 
   private send(message: { type: string; payload: any }): void {
     if (!this.isConnected) {
-      console.error("Can't send a message without an active connection!");
-      return;
+      throw new Error("Can't send a message without an active connection!");
     }
 
     this.server?.send(JSON.stringify(message));
   }
 }
-
-const now = () => {
-  const date = new Date();
-  return `[${date.getHours()}:${date.getMinutes()}:${date.getSeconds()}.${date.getMilliseconds()}]`;
-};

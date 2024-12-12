@@ -1,16 +1,17 @@
+import { ENV } from "./constants";
+import { Emitter } from "./emitter";
+import { randomId } from "./random";
+import { isShallowEqual } from "./utils";
 import { getDefaultAppState } from "./appState";
 import { AppStateChange, ElementsChange } from "./change";
-import { ENV } from "./constants";
 import { newElementWith } from "./element/mutateElement";
 import { deepCopyElement } from "./element/newElement";
+import type { AppState, ObservedAppState } from "./types";
+import type { ValueOf } from "./utility-types";
 import type {
   OrderedExcalidrawElement,
   SceneElementsMap,
 } from "./element/types";
-import { Emitter } from "./emitter";
-import type { AppState, ObservedAppState } from "./types";
-import type { ValueOf } from "./utility-types";
-import { isShallowEqual } from "./utils";
 
 // hidden non-enumerable property for runtime checks
 const hiddenObservedAppStateProp = "__observedAppState";
@@ -161,7 +162,7 @@ export class Store {
       if (!elementsChange.isEmpty() || !appStateChange.isEmpty()) {
         // Notify listeners with the increment
         this.onStoreIncrementEmitter.trigger(
-          new StoreIncrement(elementsChange, appStateChange),
+          StoreIncrement.create(elementsChange, appStateChange),
         );
       }
 
@@ -265,13 +266,50 @@ export class Store {
  * Represent an increment to the Store.
  */
 export class StoreIncrement {
-  constructor(
+  private constructor(
+    public readonly id: string,
     public readonly elementsChange: ElementsChange,
     public readonly appStateChange: AppStateChange,
   ) {}
 
+  /**
+   * Create a new instance of `StoreIncrement`.
+   */
+  public static create = (
+    elementsChange: ElementsChange,
+    appStateChange: AppStateChange,
+    opts: {
+      id: string;
+    } = {
+      id: randomId(),
+    },
+  ) => {
+    return new StoreIncrement(opts.id, elementsChange, appStateChange);
+  };
+
+  /**
+   * Parse and load the increment from the remote payload.
+   */
+  public static load = (payload: string) => {
+    // CFDO: ensure typesafety
+    const {
+      id,
+      elementsChange: { added, removed, updated },
+    } = JSON.parse(payload);
+
+    const elementsChange = ElementsChange.create(added, removed, updated, {
+      shouldRedistribute: false,
+    });
+
+    return new StoreIncrement(id, elementsChange, AppStateChange.empty());
+  };
+
+  /**
+   * Inverse store increment, creates new instance of `StoreIncrement`.
+   */
   public inverse(): StoreIncrement {
     return new StoreIncrement(
+      randomId(),
       this.elementsChange.inverse(),
       this.appStateChange.inverse(),
     );
@@ -281,10 +319,13 @@ export class StoreIncrement {
    * Apply latest (remote) changes to the increment, creates new instance of `StoreIncrement`.
    */
   public applyLatestChanges(elements: SceneElementsMap): StoreIncrement {
-    const updatedElementsChange =
-      this.elementsChange.applyLatestChanges(elements);
+    const inversedIncrement = this.inverse();
 
-    return new StoreIncrement(updatedElementsChange, this.appStateChange);
+    return new StoreIncrement(
+      inversedIncrement.id,
+      inversedIncrement.elementsChange.applyLatestChanges(elements),
+      inversedIncrement.appStateChange,
+    );
   }
 
   public isEmpty() {

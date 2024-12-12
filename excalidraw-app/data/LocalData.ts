@@ -42,6 +42,7 @@ import { SAVE_TO_LOCAL_STORAGE_TIMEOUT, STORAGE_KEYS } from "../app_constants";
 import { FileManager } from "./FileManager";
 import { Locker } from "./Locker";
 import { updateBrowserStateVersion } from "./tabSync";
+import type { StoreIncrement } from "../../packages/excalidraw/store";
 
 const filesStore = createStore("files-db", "files-store");
 
@@ -254,5 +255,60 @@ export class LibraryLocalStorageMigrationAdapter {
   }
   static clear() {
     localStorage.removeItem(STORAGE_KEYS.__LEGACY_LOCAL_STORAGE_LIBRARY);
+  }
+}
+
+interface SyncIncrementPersistedData {
+  increments: StoreIncrement[];
+}
+
+interface SyncMetaPersistedData {
+  lastAcknowledgedVersion: number;
+}
+
+export class SyncIndexedDBAdapter {
+  /** IndexedDB database and store name */
+  private static idb_name = STORAGE_KEYS.IDB_SYNC;
+  /** library data store keys */
+  private static incrementsKey = "increments";
+  private static metadataKey = "metadata";
+
+  private static store = createStore(
+    `${SyncIndexedDBAdapter.idb_name}-db`,
+    `${SyncIndexedDBAdapter.idb_name}-store`,
+  );
+
+  static async loadIncrements() {
+    const IDBData = await get<SyncIncrementPersistedData>(
+      SyncIndexedDBAdapter.incrementsKey,
+      SyncIndexedDBAdapter.store,
+    );
+
+    return IDBData || null;
+  }
+
+  static async saveIncrements(data: SyncIncrementPersistedData): Promise<void> {
+    return set(
+      SyncIndexedDBAdapter.incrementsKey,
+      data,
+      SyncIndexedDBAdapter.store,
+    );
+  }
+
+  static async loadMetadata() {
+    const IDBData = await get<SyncMetaPersistedData>(
+      SyncIndexedDBAdapter.metadataKey,
+      SyncIndexedDBAdapter.store,
+    );
+
+    return IDBData || null;
+  }
+
+  static async saveMetadata(data: SyncMetaPersistedData): Promise<void> {
+    return set(
+      SyncIndexedDBAdapter.metadataKey,
+      data,
+      SyncIndexedDBAdapter.store,
+    );
   }
 }

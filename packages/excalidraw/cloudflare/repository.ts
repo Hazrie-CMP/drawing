@@ -1,17 +1,17 @@
 import type {
-  ChangesRepository,
-  CLIENT_CHANGE,
-  SERVER_CHANGE,
+  IncrementsRepository,
+  CLIENT_INCREMENT,
+  SERVER_INCREMENT,
 } from "../sync/protocol";
 
 // CFDO: add senderId, possibly roomId as well
-export class DurableChangesRepository implements ChangesRepository {
+export class DurableIncrementsRepository implements IncrementsRepository {
   constructor(private storage: DurableObjectStorage) {
     // #region DEV ONLY
-    // this.storage.sql.exec(`DROP TABLE IF EXISTS changes;`);
+    // this.storage.sql.exec(`DROP TABLE IF EXISTS increments;`);
     // #endregion
 
-    this.storage.sql.exec(`CREATE TABLE IF NOT EXISTS changes(
+    this.storage.sql.exec(`CREATE TABLE IF NOT EXISTS increments(
 			id			TEXT PRIMARY KEY,
 			payload		TEXT NOT NULL,
 			version		INTEGER NOT NULL DEFAULT 1,
@@ -19,19 +19,19 @@ export class DurableChangesRepository implements ChangesRepository {
 		);`);
   }
 
-  public saveAll = (changes: Array<CLIENT_CHANGE>) => {
+  public saveAll = (increments: Array<CLIENT_INCREMENT>) => {
     return this.storage.transactionSync(() => {
       const prevVersion = this.getLastVersion();
-      const nextVersion = prevVersion + changes.length;
+      const nextVersion = prevVersion + increments.length;
 
-      // CFDO: in theory payload could contain array of changes, if we would need to optimize writes
-      for (const [index, change] of changes.entries()) {
+      // CFDO: in theory payload could contain array of increments, if we would need to optimize writes
+      for (const [index, increment] of increments.entries()) {
         const version = prevVersion + index + 1;
-        // unique id ensures that we don't acknowledge the same change twice
+        // unique id ensures that we don't acknowledge the same increment twice
         this.storage.sql.exec(
-          `INSERT INTO changes (id, payload, version) VALUES (?, ?, ?);`,
-          change.id,
-          JSON.stringify(change),
+          `INSERT INTO increments (id, payload, version) VALUES (?, ?, ?);`,
+          increment.id,
+          JSON.stringify(increment),
           version,
         );
       }
@@ -47,10 +47,10 @@ export class DurableChangesRepository implements ChangesRepository {
     });
   };
 
-  public getSinceVersion = (version: number): Array<SERVER_CHANGE> => {
+  public getSinceVersion = (version: number): Array<SERVER_INCREMENT> => {
     return this.storage.sql
-      .exec<SERVER_CHANGE>(
-        `SELECT id, payload, version FROM changes WHERE version > (?) ORDER BY version ASC;`,
+      .exec<SERVER_INCREMENT>(
+        `SELECT id, payload, version FROM increments WHERE version > (?) ORDER BY version ASC;`,
         version,
       )
       .toArray();
@@ -58,7 +58,7 @@ export class DurableChangesRepository implements ChangesRepository {
 
   public getLastVersion = (): number => {
     const result = this.storage.sql
-      .exec(`SELECT MAX(version) FROM changes;`)
+      .exec(`SELECT MAX(version) FROM increments;`)
       .one();
 
     return result ? Number(result["MAX(version)"]) : 0;

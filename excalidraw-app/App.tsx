@@ -367,8 +367,8 @@ const ExcalidrawWrapper = () => {
   const [syncAPI] = useAtom(syncAPIAtom);
   const [nextVersion, setNextVersion] = useState(-1);
   const currentVersion = useRef(-1);
-  const [acknowledgedChanges, setAcknowledgedChanges] = useState<
-    ElementsChange[]
+  const [acknowledgedIncrements, setAcknowledgedIncrements] = useState<
+    StoreIncrement[]
   >([]);
   const [isCollaborating] = useAtomWithInitialValue(isCollaboratingAtom, () => {
     return isCollaborationLink(window.location.href);
@@ -377,7 +377,7 @@ const ExcalidrawWrapper = () => {
 
   useEffect(() => {
     const interval = setInterval(() => {
-      setAcknowledgedChanges([...(syncAPI?.acknowledgedChanges ?? [])]);
+      setAcknowledgedIncrements([...(syncAPI?.acknowledgedIncrements ?? [])]);
     }, 250);
 
     syncAPI?.reconnect();
@@ -689,10 +689,13 @@ const ExcalidrawWrapper = () => {
     // - wysiwyg, dragging elements / points, mouse movements, etc.
     const { elementsChange } = increment;
 
-    // some appState like selections should also be transfered (we could even persist it)
+    // CFDO: some appState like selections should also be transfered (we could even persist it)
     if (!elementsChange.isEmpty()) {
-      console.log(elementsChange)
-      syncAPI?.push("durable", [elementsChange]);
+      try {
+        syncAPI?.push("durable", increment);
+      } catch (e) {
+        console.error(e);
+      }
     }
   };
 
@@ -823,22 +826,23 @@ const ExcalidrawWrapper = () => {
       excalidrawAPI?.getSceneElements().map((x) => [x.id, x]),
     );
 
-    let changes: ElementsChange[] = [];
+    let increments: StoreIncrement[] = [];
 
     const goingLeft =
       currentVersion.current === -1 || value - currentVersion.current <= 0;
 
     if (goingLeft) {
-      changes = acknowledgedChanges
+      increments = acknowledgedIncrements
         .slice(value)
         .reverse()
         .map((x) => x.inverse());
     } else {
-      changes = acknowledgedChanges.slice(currentVersion.current, value) ?? [];
+      increments =
+        acknowledgedIncrements.slice(currentVersion.current, value) ?? [];
     }
 
-    for (const change of changes) {
-      [elements] = change.applyTo(
+    for (const increment of increments) {
+      [elements] = increment.elementsChange.applyTo(
         elements as SceneElementsMap,
         excalidrawAPI?.store.snapshot.elements!,
       );
@@ -847,7 +851,7 @@ const ExcalidrawWrapper = () => {
     excalidrawAPI?.updateScene({
       appState: {
         ...excalidrawAPI?.getAppState(),
-        viewModeEnabled: value !== acknowledgedChanges.length,
+        viewModeEnabled: value !== acknowledgedIncrements.length,
       },
       elements: Array.from(elements.values()),
       storeAction: StoreAction.UPDATE,
@@ -873,8 +877,8 @@ const ExcalidrawWrapper = () => {
         }}
         step={1}
         min={0}
-        max={acknowledgedChanges.length}
-        value={nextVersion === -1 ? acknowledgedChanges.length : nextVersion}
+        max={acknowledgedIncrements.length}
+        value={nextVersion === -1 ? acknowledgedIncrements.length : nextVersion}
         onChange={(value) => {
           setNextVersion(value as number);
           debouncedTimeTravel(value as number);
